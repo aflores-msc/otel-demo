@@ -3,57 +3,82 @@ import random
 
 # --- TRACING IMPORTS ---
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import TracerProvider, SpanProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Status, StatusCode
 
-# === CONFIGURATION ===
-# Arize Phoenix uses port 4317 for its gRPC OTLP receiver
+# === 1. CUSTOM SPAN PROCESSOR ===
+class PIIMaskingProcessor(SpanProcessor):
+    """
+    Intercepts spans on their way out to redact sensitive attributes.
+    Because spans are strictly read-only by the time 'on_end' is called, 
+    we must safely modify the internal '_attributes' dictionary.
+    """
+    def on_start(self, span, parent_context=None):
+        pass
+
+    def on_end(self, span):
+        # Ensure the span actually has attributes before checking
+        if not getattr(span, "_attributes", None):
+            return
+            
+        # Check for our specific sensitive key
+        if "payment.amount" in span._attributes:
+            # Mask the value directly in the underlying dictionary
+            span._attributes["payment.amount"] = "[REDACTED]"
+            
+            # Optional: Add an audit flag to show the processor did its job
+            span._attributes["security.pii_scrubbed"] = True
+
+    def force_flush(self, timeout_millis=30000):
+        return True
+
+    def shutdown(self):
+        pass
+
+
+# === 2. CONFIGURATION & SETUP ===
 PHOENIX_GRPC_ENDPOINT = "http://localhost:4317" 
 
-# === SETUP TRACING ===
 trace_provider = TracerProvider()
-# insecure=True is required because local Phoenix does not use SSL/TLS
+
+# WARNING: Processor order matters! 
+# We must add the masking processor FIRST so it scrubs the data 
+# before the BatchSpanProcessor packages it for export.
+masking_processor = PIIMaskingProcessor()
+trace_provider.add_span_processor(masking_processor)
+
+# Add the Exporter SECOND
 otlp_trace_exporter = OTLPSpanExporter(endpoint=PHOENIX_GRPC_ENDPOINT, insecure=True)
 trace_provider.add_span_processor(BatchSpanProcessor(otlp_trace_exporter))
+
 trace.set_tracer_provider(trace_provider)
 tracer = trace.get_tracer("payment_service")
 
-# === CUSTOM EVALUATION LOGIC ===
+
+# === 3. CUSTOM EVALUATION LOGIC ===
 def run_ai_eval(amount):
-    """
-    Simulates an 'LLM-as-a-Judge' evaluation.
-    In a real app, this might check for toxicity, hallucinations, or correct formatting.
-    """
+    """Simulates an AI checking the transaction."""
     score = random.uniform(0.5, 1.0)
-    # Give it a strict rule so we see some failures in the dashboard
     label = "Pass" if (amount < 400 and score > 0.65) else "Fail"
     return score, label
 
-# === APPLICATION LOGIC ===
+
+# === 4. APPLICATION LOGIC ===
 def process_payment(amount, user_id):
-    # Start the trace
     with tracer.start_as_current_span("process_payment_request") as span:
         
-        # 1. ADD ATTRIBUTES
-        # Phoenix uses these to calculate your 'Metrics' (like average payment amount)
+        # We add the sensitive amount here. The app "thinks" it's recording it normally.
         span.set_attribute("payment.amount", amount)
         span.set_attribute("user.id", user_id)
         
-        # 2. SIMULATE LOGGING (Span Events)
-        # Because Phoenix is trace-centric, we use events instead of traditional logs.
-        # These will appear as chronological markers inside your trace waterfall.
         span.add_event("Validating user credentials", {"user.id": user_id})
         time.sleep(random.uniform(0.1, 0.3))
         
         success = random.choice([True, True, False])
         
-        # 3. RUN AI EVALUATION
         eval_score, eval_label = run_ai_eval(amount)
-        
-        # Phoenix automatically discovers attributes starting with 'eval.' 
-        # and populates them in the 'Evaluations' tab in the UI.
         span.set_attribute("eval.correctness.score", eval_score)
         span.set_attribute("eval.correctness.label", eval_label)
 
@@ -61,26 +86,23 @@ def process_payment(amount, user_id):
             span.add_event("Payment authorized by gateway")
             print(f"✅ Success: {user_id} - ${amount}")
         else:
-            # 4. ERROR HANDLING
-            # Setting this status triggers the 'Error Rate' metric to go up in Phoenix
             span.set_status(Status(StatusCode.ERROR, "Bank Gateway Timeout"))
             span.add_event("Payment rejected", {"reason": "Gateway Timeout"})
             print(f"❌ Failed: {user_id} - ${amount}")
 
-# === EXECUTION ===
+
+# === 5. EXECUTION ===
 if __name__ == "__main__":
-    print(f"🚀 OTel Demo Active. Sending Traces to Arize Phoenix via gRPC (4317)...")
+    print(f"🚀 OTel Demo Active. Sending PII-Masked Traces to Phoenix via gRPC ({PHOENIX_GRPC_ENDPOINT})...")
     
     try:
-        # Generate 10 sample traces to give us some good data to look at
         for i in range(10):
             process_payment(amount=random.randint(50, 500), user_id=f"user_{i+100}")
             time.sleep(0.5)
             
         print("📤 All traces sent. Flushing buffers...")
-        # Shutting down the provider ensures all batches are sent immediately
         trace_provider.shutdown()
-        print("Done. Visit http://localhost:6006 to see your results!")
+        print("Done. Visit http://localhost:6006 to verify your payment amounts are [REDACTED]!")
         
     except KeyboardInterrupt:
         print("Stopped by user.")
