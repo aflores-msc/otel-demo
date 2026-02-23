@@ -18,7 +18,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace import Status, StatusCode, format_span_id, format_trace_id
 
-# === 1. SPAN PROCESSOR ===
+# === 1. THE COMPLETE SPAN PROCESSOR ===
 class SecurityAndContextProcessor(SpanProcessor):
     """
     A custom SpanProcessor that intercepts span start and end events.
@@ -35,6 +35,7 @@ class SecurityAndContextProcessor(SpanProcessor):
         ctx = span.get_span_context()
         span.set_attribute("meta.trace_id", format_trace_id(ctx.trace_id))
         span.set_attribute("meta.span_id", format_span_id(ctx.span_id))
+        
         if span.parent:
             span.set_attribute("meta.parent_id", format_span_id(span.parent.span_id))
 
@@ -43,7 +44,7 @@ class SecurityAndContextProcessor(SpanProcessor):
         Called when a span is ended. Redacts 'payment.amount' if present.
         """
         if getattr(span, "_attributes", None) and "payment.amount" in span._attributes:
-            span._attributes["payment.amount"] = "[REDACTED]"
+            span._attributes["payment.amount"] = "[PII_MASKED]"
             span._attributes["security.pii_scrubbed"] = True
 
     def force_flush(self, timeout_millis=30000):
@@ -52,17 +53,15 @@ class SecurityAndContextProcessor(SpanProcessor):
     def shutdown(self):
         pass
 
-# === 2. SETUP ===
+
+# === 2. CONFIGURATION & SETUP ===
 PHOENIX_GRPC_ENDPOINT = "http://localhost:4317" 
 
 trace_provider = TracerProvider()
 """
 IMPORTANT: SpanProcessor Registration Order
-
 The order is critical because it dictates the pipeline of operations performed on a span before it leaves your application.
-- The SecurityAndContextProcessor is responsible for modifying the span data.
-- The BatchSpanProcessor is responsible for exporting the span data to the backend.
-- You want these modifications to happen before the span is handed off to the exporter.
+You want these modifications to happen before the span is handed off to the exporter.
 
 1. SecurityAndContextProcessor (First):
    - Modifies the span (adds metadata).
@@ -73,12 +72,16 @@ The order is critical because it dictates the pipeline of operations performed o
    - Exports the span to the backend.
    - If this ran first, the unredacted span would be queued for export, causing a data leak.
 """
+# Add our dual-purpose processor FIRST
 trace_provider.add_span_processor(SecurityAndContextProcessor())
+
+# Add the OTLP Exporter SECOND
 otlp_trace_exporter = OTLPSpanExporter(endpoint=PHOENIX_GRPC_ENDPOINT, insecure=True)
 trace_provider.add_span_processor(BatchSpanProcessor(otlp_trace_exporter))
 
 trace.set_tracer_provider(trace_provider)
 tracer = trace.get_tracer("payment_service")
+
 
 # === 3. SUB-PROCESS 1: AI EVALUATION ===
 def run_ai_eval(amount):
@@ -94,7 +97,6 @@ def run_ai_eval(amount):
     with tracer.start_as_current_span("ai_fraud_evaluation") as child_span:
         time.sleep(random.uniform(0.05, 0.15)) 
         
-        # Boosted AI pass rate: mostly passes unless amount is very high
         score = random.uniform(0.7, 1.0)
         label = "Pass" if (amount < 450 and score > 0.75) else "Fail"
         
@@ -102,6 +104,7 @@ def run_ai_eval(amount):
         child_span.set_attribute("eval.score", score)
         
         return score, label
+
 
 # === 4. SUB-PROCESS 2: GATEWAY ===
 def call_payment_gateway(amount):
@@ -115,18 +118,20 @@ def call_payment_gateway(amount):
         bool: True if payment succeeded, False otherwise.
     """
     with tracer.start_as_current_span("stripe_gateway_auth") as child_span:
+        # You can also manually inject IDs straight into your Event "Logs"
         ctx = child_span.get_span_context()
         child_span.add_event("Connecting to API", {
             "log.span_id": format_span_id(ctx.span_id)
         })
+        
         time.sleep(random.uniform(0.1, 0.2)) 
         
-        # Boosted Gateway pass rate to ~80%
         success = random.choice([True, True, True, True, False])
         if not success:
             child_span.set_status(Status(StatusCode.ERROR, "Gateway Timeout"))
             
         return success
+
 
 # === 5. PARENT SPAN ===
 def process_payment(amount, user_id):
@@ -163,19 +168,19 @@ def process_payment(amount, user_id):
             parent_span.set_status(Status(StatusCode.ERROR, "Bank Rejected"))
             print(f"❌ Gateway Failed: {user_id} - ${amount}")
 
+
 # === 6. EXECUTION ===
 if __name__ == "__main__":
-    print(f"🚀 OTel Demo Active. Generating 15 transactions...")
+    print(f"🚀 OTel Demo Active. Generating 15 enriched traces...")
     
     try:
-        # Increased to 15 iterations to generate a solid batch of successes and failures
         for i in range(15):
             process_payment(amount=random.randint(50, 480), user_id=f"user_{i+100}")
             time.sleep(0.2)
             
         print("📤 Flushing buffers to Phoenix...")
         trace_provider.shutdown()
-        print("Done. Check the Phoenix UI!")
+        print("Done. Check the Phoenix UI for your explicitly injected IDs!")
         
     except KeyboardInterrupt:
         pass
